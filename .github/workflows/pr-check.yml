@@ -28,6 +28,8 @@ jobs:
           python-version: "3.12"
 
       - name: 运行端到端契约测试
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 -m unittest discover -s tests -v
 
       - name: 校验 JSON 语法
