@@ -49,9 +49,10 @@ PAKE_SCHEMA_KEYS = {
     "camera", "microphone",
 }
 
-# Best practice: mobile viewport 420x840, floor 380x640.
-MOBILE_VIEWPORT = (420, 840)
-MOBILE_MIN = (380, 640)
+# Google Tasks has no mobile web UI (verified: iPhone UA returns byte-identical
+# desktop HTML; /tasks/u/0/ is 404), so the desktop viewport is correct here.
+DESKTOP_VIEWPORT = (1200, 800)
+DESKTOP_MIN = (800, 600)
 
 
 def load_json(path):
@@ -109,11 +110,11 @@ class AppJsonContractTest(unittest.TestCase):
             self.cfg["identifier"], r"^[a-zA-Z][a-zA-Z0-9.-]*[a-zA-Z0-9]$"
         )
 
-    def test_mobile_viewport_and_floor(self):
-        self.assertEqual(MOBILE_VIEWPORT[0], self.cfg["width"])
-        self.assertEqual(MOBILE_VIEWPORT[1], self.cfg["height"])
-        self.assertEqual(MOBILE_MIN[0], self.cfg["minWidth"])
-        self.assertEqual(MOBILE_MIN[1], self.cfg["minHeight"])
+    def test_desktop_viewport_and_floor(self):
+        self.assertEqual(DESKTOP_VIEWPORT[0], self.cfg["width"])
+        self.assertEqual(DESKTOP_VIEWPORT[1], self.cfg["height"])
+        self.assertEqual(DESKTOP_MIN[0], self.cfg["minWidth"])
+        self.assertEqual(DESKTOP_MIN[1], self.cfg["minHeight"])
 
     def test_native_title_bar_kept(self):
         # hideTitleBar injects a 20px #pake-top-dom drag layer that swallows
@@ -182,7 +183,12 @@ class ReleaseWorkflowContractTest(unittest.TestCase):
 
 
 class AerospaceRuleTest(unittest.TestCase):
-    """Floating rules must exist, terminate the callback chain, and win the race."""
+    """GoogleTasks is a desktop app: it belongs to Workspace 5, not the floating layer.
+
+    It was originally shipped as a 420x840 mobile widget with global floating
+    follow, but Google Tasks has no mobile web UI (iPhone UA returns the same
+    desktop HTML), so the viewport and the window rule both moved to desktop.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -192,6 +198,13 @@ class AerospaceRuleTest(unittest.TestCase):
             raise unittest.SkipTest("AeroSpace config not present (CI)")
         cls.toml = AEROSPACE_TOML.read_text(encoding="utf-8")
         cls.sticky = STICKY_SCRIPT.read_text(encoding="utf-8")
+        cls.blocks = cls.toml.split("[[on-window-detected]]")
+
+    def _own_blocks(self):
+        return [
+            b for b in self.blocks
+            if self.identifier in b or "(?i)googletasks" in b
+        ]
 
     def test_bundle_id_rule_matches_app_json(self):
         self.assertIn(f"if.app-id = '{self.identifier}'", self.toml)
@@ -199,22 +212,21 @@ class AerospaceRuleTest(unittest.TestCase):
     def test_fallback_name_rule_present(self):
         self.assertIn("if.app-name-regex-substring = '(?i)googletasks'", self.toml)
 
-    def test_rules_terminate_callback_chain(self):
-        # Later rules move windows to fixed workspaces; without this the
-        # floating widget gets pinned to one workspace.
-        for block in self.toml.split("[[on-window-detected]]"):
-            if self.identifier in block or "(?i)googletasks" in block:
-                self.assertIn("check-further-callbacks = false", block)
+    def test_rules_pin_to_workspace_5(self):
+        blocks = self._own_blocks()
+        self.assertEqual(2, len(blocks), f"expected 2 rules, got {len(blocks)}")
+        for block in blocks:
+            self.assertIn("move-node-to-workspace 5", block)
 
-    def test_floating_rule_precedes_workspace_rules(self):
-        float_at = self.toml.find(f"if.app-id = '{self.identifier}'")
-        pin_at = self.toml.find("move-node-to-workspace")
-        self.assertNotEqual(-1, float_at)
-        self.assertNotEqual(-1, pin_at)
-        self.assertLess(float_at, pin_at)
+    def test_rules_are_not_floating(self):
+        # Floating would detach it from Workspace 5 and fight the sticky script.
+        for block in self._own_blocks():
+            self.assertNotIn("layout floating", block)
 
-    def test_sticky_script_nans_the_bundle_id(self):
-        self.assertIn(f'"{self.identifier}"', self.sticky)
+    def test_sticky_script_does_not_nan_a_pinned_app(self):
+        # sticky-notes.sh only follows windows that are floating; a workspace-5
+        # app must stay out of that list or it gets dragged onto every workspace.
+        self.assertNotIn(f'"{self.identifier}"', self.sticky)
 
 
 class InstalledAppTest(unittest.TestCase):
@@ -272,52 +284,51 @@ class LiveWindowTest(unittest.TestCase):
             if line.startswith(self.cfg["identifier"])
         ]
 
-    def test_window_is_floating(self):
+    def test_window_is_pinned_to_workspace_5(self):
         windows = self._windows()
         if not windows:
             raise unittest.SkipTest("GoogleTasks window is not open")
-        self.assertEqual({"floating"}, {w[2] for w in windows})
+        self.assertEqual({"5"}, {w[3] for w in windows})
 
     @unittest.skipUnless(os.environ.get("GT_LIVE") == "1", "set GT_LIVE=1 to run")
-    def test_window_follows_workspace_switch(self):
+    def test_window_stays_put_when_switching_away(self):
+        # A pinned desktop app must NOT be dragged along with the floating
+        # widgets when the user moves to another workspace.
         windows = self._windows()
         if not windows:
             raise unittest.SkipTest("GoogleTasks window is not open")
         window_id = windows[0][1]
-        for workspace in ("3", "7"):
+        for workspace in ("1", "7"):
             with self.subTest(workspace=workspace):
                 run([self.aerospace, "workspace", workspace])
-                deadline = 20
-                followed = False
-                for _ in range(deadline // 2):
-                    result = run(
-                        [self.aerospace, "list-windows", "--monitor", "all",
-                         "--format", "%{window-id} %{workspace}"]
-                    )
-                    for line in result.stdout.splitlines():
-                        if line.split()[:1] == [window_id]:
-                            followed = line.split()[1] == workspace
-                            break
-                    if followed:
+                result = run(
+                    [self.aerospace, "list-windows", "--monitor", "all",
+                     "--format", "%{window-id} %{workspace}"]
+                )
+                current = None
+                for line in result.stdout.splitlines():
+                    if line.split()[:1] == [window_id]:
+                        current = line.split()[1]
                         break
-                self.assertTrue(
-                    followed, f"window {window_id} did not follow to workspace {workspace}"
+                self.assertEqual(
+                    "5", current,
+                    f"window {window_id} left workspace 5 while focusing {workspace}",
                 )
 
 
 @unittest.skipUnless(shutil.which("gh"), "gh not installed")
 class PublishedReleaseTest(unittest.TestCase):
-    def test_release_has_all_platform_assets(self):
+    def test_latest_release_has_all_platform_assets(self):
         result = run(
-            ["gh", "release", "view", "v1.0.0", "--repo",
-             "yaping-pro/googletask-desktop", "--json", "assets",
-             "-q", ".assets[].name"]
+            ["gh", "release", "view", "--repo", "yaping-pro/googletask-desktop",
+             "--json", "tagName,assets", "-q", ".tagName + \"\\n\" + (.assets[].name)"]
         )
         if result.returncode != 0:
             raise unittest.SkipTest(f"release lookup failed: {result.stderr.strip()}")
-        names = result.stdout
+        output = result.stdout
         for extension in (".dmg", ".msi", ".deb", ".AppImage"):
-            self.assertIn(extension, names)
+            self.assertIn(extension, output)
+
 
 
 if __name__ == "__main__":
