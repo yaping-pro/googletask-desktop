@@ -14,3 +14,7 @@ node_modules/
 
 # Logs
 *.log
+
+# Python
+__pycache__/
+*.pyc
